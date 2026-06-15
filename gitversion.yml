@@ -1,0 +1,33 @@
+# REFERENCE ONLY - this file is NOT used by this repo. Copy it into the CONSUMER repo root.
+#
+# `michielvha/gitversion-tag-action` (used in the consumer's caller workflow) reads the
+# consumer's own `gitversion.yml` at the repo root (its default `configFilePath`). This copy
+# is shipped purely as a starting point for that consumer config.
+#
+# GitHubFlow + increment: None + ContinuousDeployment means the version only bumps when a
+# conventional-commit message dictates it (feat:/fix:/etc.); chore/docs/ci/style/test do NOT bump.
+# A no-bump push resolves to the already-tagged version, so the release is skipped.
+workflow: GitHubFlow/v1
+next-version: 0.0.0
+tag-prefix: 'v'
+semantic-version-format: Loose
+
+major-version-bump-message: '(BREAKING CHANGE|^.+!:)'
+minor-version-bump-message: '^feat(\([^)]+\))?:\s'
+patch-version-bump-message: '^(fix|enhancement|perf|refactor|revert)(\([^)]+\))?:\s'
+no-bump-message: '^(chore|docs|style|test|ci)(\([^)]+\))?:\s'
+commit-message-incrementing: Enabled
+
+strategies:
+  - Fallback
+  - MergeMessage
+  - TaggedCommit
+  - TrackReleaseBranches
+  - VersionInBranchName
+
+branches:
+  main:
+    regex: ^master$|^main$
+    is-main-branch: true
+    increment: None
+    mode: ContinuousDeployment

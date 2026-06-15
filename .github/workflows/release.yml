@@ -1,0 +1,233 @@
+# Copyright (c) 2026 VH & Co BV. Licensed under the Apache License 2.0. See LICENSE for details.
+#
+# Reusable RELEASE workflow (`on: workflow_call`) - the PRIMARY way to consume this repo.
+#
+# One macOS job that composes a full release for a SwiftKit menu-bar app from existing pieces:
+#
+#   1. actions/checkout (full history - GitVersion needs it).
+#   2. michielvha/gitversion-tag-action@v6 - the OWNER's existing action. It computes the next
+#      SemVer from conventional commits and ALWAYS runs `git tag <prefix><semVer> && git push`.
+#      This is op-or-fail and IS the release gate:
+#        - a real version bump -> the tag is new -> it is created+pushed -> the job continues.
+#        - a no-bump push        -> the tag already exists -> `git tag` errors -> the step FAILS
+#                                   -> the job stops here (no build, no Release). That is intended.
+#      There is no separate "should-release" output; the step's success/failure is the signal.
+#      (Do NOT re-implement gittools/gitversion setup/execute here, and do NOT add a synthetic
+#      always-run no-op to swallow the no-bump failure - the failure IS the no-op.)
+#   3. (optional) import a Developer-ID cert into a temporary keychain - only when `notarize` is
+#      true and the signing secrets are present.
+#   4. vhco-pro/swift-release-action (the composite `action.yml` in this repo) - build -> embed
+#      helpers -> sign -> ditto-zip + sha256. `version` is the semVer from step 2.
+#   5. (optional) notarize + staple the produced zip - only when `notarize` is true.
+#   6. gh release create v<semVer> --generate-notes <zip> - publish the GitHub Release.
+#
+# Third-party actions are SHA-pinned (checkout, cache); the owner's gitversion-tag-action stays @v6
+# (a tag the owner controls).
+#
+# Callers consume this with a ~10-line workflow (see examples/release.yml):
+#   jobs.release.uses: vhco-pro/swift-release-action/.github/workflows/release.yml@v1
+
+name: Release (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: "Product / .app base name (drives the zip name)."
+        required: true
+        type: string
+      scheme:
+        description: "Xcode scheme to build. Defaults to app-name."
+        required: false
+        type: string
+        default: ""
+      xcode-project:
+        description: "Path to the .xcodeproj. Defaults to <app-name>.xcodeproj."
+        required: false
+        type: string
+        default: ""
+      info-plist:
+        description: "Info.plist to stamp. Defaults to <app-name>/Info.plist."
+        required: false
+        type: string
+        default: ""
+      package-path:
+        description: "SwiftPM package path to cache (.build / resolved deps). Defaults to repo root."
+        required: false
+        type: string
+        default: "."
+      helper-products:
+        description: "Space/newline-separated SwiftPM executable products to build + embed into Contents/Helpers/."
+        required: false
+        type: string
+        default: ""
+      helper-package-path:
+        description: "--package-path passed to `swift build` for the helper products."
+        required: false
+        type: string
+        default: "."
+      entitlements:
+        description: "Entitlements file applied during the --deep re-sign (optional)."
+        required: false
+        type: string
+        default: ""
+      xcodegen:
+        description: "Run `xcodegen generate` before building."
+        required: false
+        type: boolean
+        default: true
+      signing-identity:
+        description: "codesign identity. Default '-' (ad-hoc, no Apple team). For Developer ID, set notarize=true and pass the cert's common name here."
+        required: false
+        type: string
+        default: "-"
+      runner:
+        description: "Runner label for the job (e.g. macos-14, macos-15)."
+        required: false
+        type: string
+        default: "macos-14"
+      gitversion-config:
+        description: "Path to the GitVersion config file (passed to gitversion-tag-action's configFilePath)."
+        required: false
+        type: string
+        default: "gitversion.yml"
+      tag-prefix:
+        description: "Tag prefix for gitversion-tag-action and the GitHub Release name (e.g. 'v')."
+        required: false
+        type: string
+        default: "v"
+      notarize:
+        description: "Import a Developer-ID cert, build with hardened-runtime signing, then notarize + staple the zip. Requires the signing/notary secrets."
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      MACOS_CERTIFICATE:
+        description: "Base64-encoded Developer ID Application .p12 (notarize tier only)."
+        required: false
+      MACOS_CERTIFICATE_PWD:
+        description: "Password for the .p12 (notarize tier only)."
+        required: false
+      KEYCHAIN_PASSWORD:
+        description: "Password for the temporary build keychain (notarize tier only)."
+        required: false
+      NOTARY_APPLE_ID:
+        description: "Apple ID used for notarytool submission (notarize tier only)."
+        required: false
+      NOTARY_PASSWORD:
+        description: "App-specific password for notarytool (notarize tier only)."
+        required: false
+      NOTARY_TEAM_ID:
+        description: "Apple Developer Team ID for notarytool (notarize tier only)."
+        required: false
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: write # gitversion-tag-action pushes the tag; gh release create publishes the Release
+    steps:
+      - name: Checkout (full history for GitVersion)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      # Cache SwiftPM resolved deps + build products to speed up `swift build` of the helpers.
+      - name: Cache SwiftPM
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ${{ inputs.package-path }}/.build
+            ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-spm-${{ hashFiles(format('{0}/**/Package.resolved', inputs.package-path)) }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      # Compute the next SemVer from conventional commits AND tag the repo, in one step.
+      # OP-OR-FAIL GATE: a new version tags+pushes and we continue; a no-bump push makes the
+      # internal `git tag` hit an existing tag and the step fails, stopping the run. Intended.
+      - name: Compute version & tag
+        id: version
+        uses: michielvha/gitversion-tag-action@v6
+        with:
+          configFilePath: ${{ inputs.gitversion-config }}
+          prefix: ${{ inputs.tag-prefix }}
+
+      # Optional Developer-ID keychain import - only when notarize is requested.
+      - name: Import Developer-ID certificate
+        if: ${{ inputs.notarize }}
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          echo -n "$MACOS_CERTIFICATE" | base64 --decode -o "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$MACOS_CERTIFICATE_PWD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed s/\"//g)
+
+      # Build -> embed helpers -> sign -> ditto-zip + sha256. `version` is the semVer from above.
+      - name: Build & package the signed .app
+        id: build
+        uses: vhco-pro/swift-release-action@v1
+        with:
+          app-name: ${{ inputs.app-name }}
+          scheme: ${{ inputs.scheme }}
+          xcode-project: ${{ inputs.xcode-project }}
+          info-plist: ${{ inputs.info-plist }}
+          helper-products: ${{ inputs.helper-products }}
+          helper-package-path: ${{ inputs.helper-package-path }}
+          entitlements: ${{ inputs.entitlements }}
+          xcodegen: ${{ inputs.xcodegen }}
+          signing-identity: ${{ inputs.signing-identity }}
+          version: ${{ steps.version.outputs.semVer }}
+          build-number: ${{ github.run_number }}
+
+      # Optional notarize + staple of the produced zip - only when notarize is requested.
+      - name: Notarize & staple
+        if: ${{ inputs.notarize }}
+        env:
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+          NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+          ZIP_PATH: ${{ steps.build.outputs.zip-path }}
+          APP_NAME: ${{ inputs.app-name }}
+        run: |
+          set -euo pipefail
+          # Submit the zip (which contains the .app) and wait for the verdict.
+          xcrun notarytool submit "$ZIP_PATH" \
+            --apple-id "$NOTARY_APPLE_ID" \
+            --password "$NOTARY_PASSWORD" \
+            --team-id "$NOTARY_TEAM_ID" \
+            --wait
+          # Staple the ticket onto the .app, then re-zip so the asset carries the ticket.
+          WORK="$RUNNER_TEMP/notarize"
+          mkdir -p "$WORK"
+          ditto -x -k "$ZIP_PATH" "$WORK"
+          xcrun stapler staple "$WORK/${APP_NAME}.app"
+          rm -f "$ZIP_PATH"
+          ditto -c -k --sequesterRsrc --keepParent "$WORK/${APP_NAME}.app" "$ZIP_PATH"
+          shasum -a 256 "$ZIP_PATH" | sed "s| .*/| |" > "$ZIP_PATH.sha256"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_PREFIX: ${{ inputs.tag-prefix }}
+          SEMVER: ${{ steps.version.outputs.semVer }}
+          APP_NAME: ${{ inputs.app-name }}
+          ZIP_PATH: ${{ steps.build.outputs.zip-path }}
+        run: |
+          set -euo pipefail
+          gh release create "${TAG_PREFIX}${SEMVER}" \
+            --title "${APP_NAME} ${SEMVER}" \
+            --generate-notes \
+            "$ZIP_PATH"

@@ -1,0 +1,53 @@
+# Copyright (c) 2026 VH & Co BV. Licensed under the Apache License 2.0. See LICENSE for details.
+#
+# Canonical CALLER workflow. Copy this into the CONSUMING repo as `.github/workflows/release.yml`.
+#
+# It is a THIN caller: it delegates the entire release pipeline (checkout -> compute version & tag
+# via michielvha/gitversion-tag-action -> build/sign/package -> GitHub Release) to this repo's
+# REUSABLE workflow. You only supply your app's inputs; everything mechanical lives upstream.
+#
+# Example: how `claude-companion` (a macOS Swift menu-bar app, XcodeGen + local SwiftPM package
+# with an embedded helper executable) consumes it.
+#
+# Op-or-fail gate: gitversion-tag-action ALWAYS tries to `git tag <prefix><semVer>`. A real version
+# bump tags+pushes and the release proceeds; a no-bump push (chore/docs/...) hits an existing tag,
+# the tag step fails, and the run stops with no Release. That failure IS the "nothing to release"
+# signal - there is no separate gate to wire up here.
+#
+# Prerequisites in the consuming repo:
+#   - gitversion.yml at the repo root (copy the reference shipped in swift-release-action).
+#   - Conventional-commit messages on main (feat:/fix:/... drive the version bump).
+#   - project.yml (XcodeGen) producing the <app>.app target, plus the helper SwiftPM product.
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '.gitignore'
+      - 'README.md'
+      - 'LICENSE'
+      - 'docs/**'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  release:
+    permissions:
+      contents: write # the reusable workflow pushes the tag and publishes the GitHub Release
+    uses: vhco-pro/swift-release-action/.github/workflows/release.yml@v1
+    with:
+      app-name: ClaudeCompanion
+      # scheme/xcode-project/info-plist default off app-name; set them only if they differ.
+      helper-products: claude-companion-helper
+      helper-package-path: ClaudeCompanionKit
+      package-path: ClaudeCompanionKit
+      entitlements: ClaudeCompanion/ClaudeCompanion.entitlements
+      xcodegen: true
+      # ad-hoc tier today (no Apple account, no secrets). For Developer ID: set notarize=true,
+      # pass the cert common name as signing-identity, and provide the signing/notary secrets.
+      signing-identity: '-'
+      notarize: false
+    secrets: inherit

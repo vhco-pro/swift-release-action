@@ -1,0 +1,244 @@
+# Copyright (c) 2026 VH & Co BV. Licensed under the Apache License 2.0. See LICENSE for details.
+#
+# Composite action: the pure, secret-free build -> embed-helpers -> sign -> package step for a
+# macOS Swift menu-bar app (the "SwiftKit" pattern, extracted from vhco-pro/ssm-connect).
+#
+# It generates the XcodeGen project (optional), does a clean Release `xcodebuild`, builds any
+# SwiftPM executable helper products and embeds them into Contents/Helpers/, re-seals the bundle
+# (codesign --force --deep) and verifies it, then `ditto`-zips the .app into dist/ with a sha256.
+#
+# This layer holds NO secrets and does NO versioning or release-publishing - `version` is an input
+# and the caller owns version computation, tagging, and GitHub-Release creation (see
+# examples/release.yml). The ad-hoc identity "-" is the default tier (no Apple team, works the same
+# locally and on CI). For Developer ID signing the caller imports the cert into the keychain first,
+# then passes its identity name via `signing-identity`.
+#
+# Reusable on its own (e.g. a CI smoke build) and composed into a caller's release workflow.
+
+name: "SwiftKit build & package"
+description: "Build, embed helpers into Contents/Helpers/, ad-hoc sign, and ditto-zip a macOS Swift menu-bar .app."
+branding:
+  icon: "package"
+  color: "orange"
+
+inputs:
+  app-name:
+    description: "Product / .app base name (drives the zip name)."
+    required: true
+  scheme:
+    description: "Xcode scheme to build. Defaults to app-name."
+    required: false
+    default: ""
+  xcode-project:
+    description: "Path to the .xcodeproj. Defaults to <app-name>.xcodeproj."
+    required: false
+    default: ""
+  info-plist:
+    description: "Info.plist to stamp. Defaults to <app-name>/Info.plist."
+    required: false
+    default: ""
+  helper-products:
+    description: "Space/newline-separated SwiftPM executable products to `swift build -c release` and embed into Contents/Helpers/."
+    required: false
+    default: ""
+  helper-package-path:
+    description: "--package-path passed to `swift build` for the helper products."
+    required: false
+    default: "."
+  entitlements:
+    description: "Entitlements file applied during the --deep re-sign (optional)."
+    required: false
+    default: ""
+  xcodegen:
+    description: "Run `xcodegen generate` before building."
+    required: false
+    default: "true"
+  signing-identity:
+    description: "codesign identity. Default '-' (ad-hoc, no Apple team)."
+    required: false
+    default: "-"
+  configuration:
+    description: "xcodebuild configuration."
+    required: false
+    default: "Release"
+  version:
+    description: "Version to stamp into CFBundleShortVersionString. If empty, the existing plist value is used."
+    required: false
+    default: ""
+  build-number:
+    description: "Value to stamp into CFBundleVersion (typically the run number). Skipped if empty."
+    required: false
+    default: ""
+  dist-dir:
+    description: "Output directory for the zip + sha256."
+    required: false
+    default: "dist"
+  derived-data-path:
+    description: "xcodebuild -derivedDataPath."
+    required: false
+    default: ".build/DerivedData"
+
+outputs:
+  zip-path:
+    description: "Path to the packaged .zip."
+    value: ${{ steps.package.outputs.zip-path }}
+  version:
+    description: "Version that was built/packaged."
+    value: ${{ steps.package.outputs.version }}
+  sha256:
+    description: "SHA-256 of the .zip."
+    value: ${{ steps.package.outputs.sha256 }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install XcodeGen
+      if: inputs.xcodegen == 'true'
+      shell: bash
+      run: |
+        if ! command -v xcodegen >/dev/null 2>&1; then
+          brew install xcodegen
+        fi
+        xcodegen --version
+
+    - name: Select the newest installed Xcode
+      shell: bash
+      # XcodeGen emits a recent project format (objectVersion 77) the runner's default Xcode can be
+      # too old to read; pick the newest Xcode on the image (parity with ssm-connect's release.yml).
+      run: |
+        newest="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1 || true)"
+        if [ -n "$newest" ]; then
+          sudo xcode-select -s "$newest/Contents/Developer"
+        fi
+        xcodebuild -version
+
+    - name: Stamp version into Info.plist
+      if: inputs.version != '' || inputs.build-number != ''
+      shell: bash
+      env:
+        APP_NAME: ${{ inputs.app-name }}
+        INFO_PLIST_IN: ${{ inputs.info-plist }}
+        VERSION: ${{ inputs.version }}
+        BUILD_NUMBER: ${{ inputs.build-number }}
+      run: |
+        set -euo pipefail
+        PLIST="${INFO_PLIST_IN:-${APP_NAME}/Info.plist}"
+        if [ -n "${VERSION}" ]; then
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION}" "$PLIST"
+        fi
+        if [ -n "${BUILD_NUMBER}" ]; then
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUMBER}" "$PLIST"
+        fi
+        echo "Stamped $PLIST"
+
+    - name: Generate Xcode project
+      if: inputs.xcodegen == 'true'
+      shell: bash
+      run: xcodegen generate
+
+    - name: Build (clean Release)
+      shell: bash
+      env:
+        APP_NAME: ${{ inputs.app-name }}
+        SCHEME_IN: ${{ inputs.scheme }}
+        PROJECT_IN: ${{ inputs.xcode-project }}
+        CONFIGURATION: ${{ inputs.configuration }}
+        SIGNING_IDENTITY: ${{ inputs.signing-identity }}
+        DERIVED: ${{ inputs.derived-data-path }}
+      run: |
+        set -euo pipefail
+        SCHEME="${SCHEME_IN:-${APP_NAME}}"
+        PROJECT="${PROJECT_IN:-${APP_NAME}.xcodeproj}"
+        # -skipPackagePluginValidation is REQUIRED: SwiftPM build-tool plugins (e.g. smithy-swift's)
+        # otherwise fail under headless xcodebuild. Force the requested identity so signing behaves
+        # identically locally and on CI (ad-hoc '-' needs no Apple team).
+        xcodebuild build \
+          -project "$PROJECT" -scheme "$SCHEME" \
+          -configuration "$CONFIGURATION" \
+          -destination 'platform=macOS,arch=arm64' \
+          -derivedDataPath "$DERIVED" \
+          -skipPackagePluginValidation \
+          CODE_SIGN_IDENTITY="$SIGNING_IDENTITY" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=YES \
+          -quiet
+
+    - name: Embed helpers, re-sign & package
+      id: package
+      shell: bash
+      env:
+        APP_NAME: ${{ inputs.app-name }}
+        CONFIGURATION: ${{ inputs.configuration }}
+        SIGNING_IDENTITY: ${{ inputs.signing-identity }}
+        HELPER_PRODUCTS: ${{ inputs.helper-products }}
+        HELPER_PACKAGE_PATH: ${{ inputs.helper-package-path }}
+        ENTITLEMENTS: ${{ inputs.entitlements }}
+        INFO_PLIST_IN: ${{ inputs.info-plist }}
+        DIST: ${{ inputs.dist-dir }}
+        DERIVED: ${{ inputs.derived-data-path }}
+      run: |
+        set -euo pipefail
+
+        APP_BUNDLE="${APP_NAME}.app"
+        APP="${DERIVED}/Build/Products/${CONFIGURATION}/${APP_BUNDLE}"
+        HELPERS_DIR="${APP}/Contents/Helpers"
+        PLIST="${INFO_PLIST_IN:-${APP_NAME}/Info.plist}"
+
+        if [ ! -d "$APP" ]; then
+          echo "::error::Built app not found at $APP" >&2
+          exit 1
+        fi
+
+        IDENTITY="${SIGNING_IDENTITY:--}"
+
+        # Ad-hoc ('-') cannot use a secure timestamp or the hardened runtime; a real Developer ID
+        # MUST use both for notarization to pass. Pick the right codesign flags per identity so the
+        # notarized tier is a correct drop-in (just supply a real signing-identity + the secrets).
+        if [ "$IDENTITY" = "-" ]; then
+          SIGN_FLAGS=(--timestamp=none)
+        else
+          SIGN_FLAGS=(--timestamp --options runtime)
+        fi
+
+        # 1) Build + embed each SwiftPM executable helper product, then sign it.
+        #    Embedding a binary after Xcode signed the app invalidates the outer seal, so the whole
+        #    app is re-signed --deep afterwards (parity with ssm-connect's postBuildScript).
+        if [ -n "${HELPER_PRODUCTS//[[:space:]]/}" ]; then
+          mkdir -p "$HELPERS_DIR"
+          for product in $HELPER_PRODUCTS; do
+            echo "==> Building helper product: $product"
+            swift build -c release --product "$product" --package-path "$HELPER_PACKAGE_PATH"
+            BIN="$(swift build -c release --product "$product" --package-path "$HELPER_PACKAGE_PATH" --show-bin-path)/$product"
+            if [ ! -f "$BIN" ]; then
+              echo "::error::Helper binary not found at $BIN" >&2
+              exit 1
+            fi
+            cp "$BIN" "$HELPERS_DIR/"
+            chmod +x "$HELPERS_DIR/$product"
+            /usr/bin/codesign --force --sign "$IDENTITY" "${SIGN_FLAGS[@]}" "$HELPERS_DIR/$product"
+            echo "    embedded $product into Contents/Helpers/"
+          done
+        fi
+
+        # 2) Re-seal the whole bundle (--deep covers nested code), then verify.
+        echo "==> Re-signing $APP_BUNDLE with identity: $IDENTITY"
+        if [ -n "$ENTITLEMENTS" ]; then
+          /usr/bin/codesign --force --deep --sign "$IDENTITY" "${SIGN_FLAGS[@]}" \
+            --entitlements "$ENTITLEMENTS" "$APP"
+        else
+          /usr/bin/codesign --force --deep --sign "$IDENTITY" "${SIGN_FLAGS[@]}" "$APP"
+        fi
+        /usr/bin/codesign --verify --deep --strict "$APP"
+
+        # 3) Resolve version (prefer the stamped plist value) and package with ditto.
+        VERSION="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$PLIST")"
+        ZIP="${DIST}/${APP_NAME}-${VERSION}.zip"
+        mkdir -p "$DIST"
+        rm -f "$ZIP" "$ZIP.sha256"
+        ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+
+        SHA="$(shasum -a 256 "$ZIP" | cut -d' ' -f1)"
+        echo "$SHA  $(basename "$ZIP")" > "$ZIP.sha256"
+
+        echo "zip-path=$ZIP" >> "$GITHUB_OUTPUT"
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+        echo "==> Packaged $ZIP (sha256 $SHA)"
