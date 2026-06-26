@@ -22,11 +22,6 @@ shipped two ways:
   calls it; you can also call it directly to build a **custom pipeline** (e.g. a
   CI smoke build).
 
-Versioning is the owner's existing
-[`michielvha/gitversion-tag-action`](https://github.com/michielvha/gitversion-tag-action)
-(not reinvented here); the GitHub Release is published inside the reusable
-workflow with `gh release create`.
-
 ## Features
 
 <p align="center">
