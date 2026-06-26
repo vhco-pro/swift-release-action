@@ -8,9 +8,7 @@
   <img src="https://img.shields.io/badge/Swift-menu--bar-orange.svg" alt="Swift menu-bar">
 </p>
 
-A reusable macOS Swift app **release pipeline** for the "SwiftKit" pattern
-(extracted from [`vhco-pro/ssm-connect`](https://github.com/vhco-pro/ssm-connect)),
-shipped two ways:
+A reusable macOS Swift app **release pipeline** for the "SwiftKit" pattern, shipped two ways:
 
 - **Reusable workflow** (`.github/workflows/release.yml`, `on: workflow_call`) -
   the **primary** way to consume this repo. One macOS job that composes the whole
