@@ -128,6 +128,12 @@ jobs:
     runs-on: ${{ inputs.runner }}
     permissions:
       contents: write # gitversion-tag-action pushes the tag; gh release create publishes the Release
+    # Expose the published release's tag + semVer so a caller can chain follow-up jobs
+    # (e.g. attaching extra assets to the same Release). Empty on a no-bump run, which fails
+    # the version step before these resolve - downstream jobs gate on `needs: release` anyway.
+    outputs:
+      tag: ${{ inputs.tag-prefix }}${{ steps.version.outputs.semVer }}
+      semver: ${{ steps.version.outputs.semVer }}
     steps:
       - name: Checkout (full history for GitVersion)
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
