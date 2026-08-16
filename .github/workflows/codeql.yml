@@ -1,0 +1,34 @@
+# Generated from vhco-pro/.github workflow-templates/codeql-actions.yml
+#
+# This repository contains no Swift sources — it is a composite action plus a
+# reusable release workflow. The code worth scanning is therefore the Actions
+# code itself: action.yml and .github/workflows/**. CodeQL's `actions` language
+# covers exactly that (workflow injection, untrusted checkout, over-broad
+# permissions), and it matters more here than in most repos because other
+# repositories consume this pipeline and inherit whatever it does.
+#
+# Runs on Linux, so it is cheap enough to scan on every push and PR.
+
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '53 4 * * 2' # weekly, Tuesday 04:53 UTC
+  workflow_dispatch:
+
+# Least-privilege at top level; the job raises only what it needs. A called
+# workflow can never hold more than the calling job grants here.
+permissions: {}
+
+jobs:
+  actions:
+    name: Actions
+    uses: vhco-pro/.github/.github/workflows/reusable-codeql-actions.yml@dd6b08eef6ffec61eeffa3d3b2f28f91658403f1 # main
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
